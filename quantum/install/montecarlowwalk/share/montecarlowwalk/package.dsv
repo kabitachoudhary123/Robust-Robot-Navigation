@@ -1,0 +1,6 @@
+source;share/montecarlowwalk/hook/pythonpath.ps1
+source;share/montecarlowwalk/hook/pythonpath.dsv
+source;share/montecarlowwalk/hook/pythonpath.sh
+source;share/montecarlowwalk/hook/ament_prefix_path.ps1
+source;share/montecarlowwalk/hook/ament_prefix_path.dsv
+source;share/montecarlowwalk/hook/ament_prefix_path.sh

@@ -1,0 +1,248 @@
+# quantum_mcts_core.py
+import math
+import numpy as np
+import random
+import time
+from typing import List, Tuple, Optional, Callable, Set
+import heapq # Priority queue for A*
+
+try:
+    from qiskit import QuantumCircuit
+    from qiskit_aer import AerSimulator
+    from qiskit.circuit.library import GroverOperator
+    from qiskit.quantum_info import PhaseOracle
+    QISKIT_AVAILABLE = True
+except ImportError:
+    QISKIT_AVAILABLE = False
+
+MAX_QUANTUM_STATES = 16
+EXPLORATION_WEIGHT = 2.0
+
+class QuantumMCTSNode:
+    # This class is unchanged
+    def __init__(self, state: Tuple[int, int], parent=None):
+        self.state = state
+        self.parent = parent
+        self.children = []
+        self.visits = 0
+        self.value = 0.0
+        self.untried_actions = []
+        self.get_logger = lambda: None 
+
+    def is_fully_expanded(self) -> bool:
+        return len(self.untried_actions) == 0
+
+    def add_child(self, child_state: Tuple[int, int], untried_actions: List[Tuple[int, int]]):
+        child_node = QuantumMCTSNode(child_state, parent=self)
+        random.shuffle(untried_actions)
+        child_node.untried_actions = untried_actions
+        child_node.get_logger = self.get_logger
+        self.children.append(child_node)
+        return child_node
+
+    def best_child(self, goal_state: Tuple[int, int], heuristic_fn: Callable, heuristic_weight: float, use_quantum=False):
+        if not self.children: return None
+        if QISKIT_AVAILABLE and use_quantum and len(self.children) > 1 and len(self.children) <= MAX_QUANTUM_STATES:
+            return self.quantum_best_child(goal_state, heuristic_fn, heuristic_weight)
+        else:
+            return self.classical_best_child(goal_state, heuristic_fn, heuristic_weight)
+
+    def classical_best_child(self, goal_state: Tuple[int, int], heuristic_fn: Callable, heuristic_weight: float):
+        best_score = -float('inf')
+        best_children = []
+        for child in self.children:
+            if child.visits == 0: return child
+            exploitation_term = child.value / child.visits
+            exploration_term = EXPLORATION_WEIGHT * math.sqrt(math.log(self.visits) / child.visits)
+            dist_to_goal = heuristic_fn(child.state, goal_state)
+            heuristic_term = heuristic_weight / (1.0 + dist_to_goal)
+            score = exploitation_term + exploration_term + heuristic_term
+            if score > best_score:
+                best_score = score
+                best_children = [child]
+            elif score == best_score:
+                best_children.append(child)
+        return random.choice(best_children)
+
+    def quantum_best_child(self, goal_state: Tuple[int, int], heuristic_fn: Callable, heuristic_weight: float):
+        try:
+            num_children = len(self.children)
+            values = [(c.value / c.visits) if c.visits > 0 else 0.0 for c in self.children]
+            threshold = np.percentile(values, 75)
+            good_indices = [i for i, v in enumerate(values) if v >= threshold and v > 0]
+            if not good_indices or len(good_indices) == num_children:
+                return self.classical_best_child(goal_state, heuristic_fn, heuristic_weight)
+            num_qubits = math.ceil(math.log2(num_children))
+            target_states_bin = [format(i, f'0{num_qubits}b') for i in good_indices]
+            oracle = PhaseOracle(target_states_bin)
+            grover_op = GroverOperator(oracle)
+            qc = QuantumCircuit(grover_op.num_qubits)
+            qc.h(range(num_qubits))
+            qc.compose(grover_op, inplace=True)
+            qc.measure_all()
+            simulator = AerSimulator()
+            result = simulator.run(qc, shots=10).result()
+            counts = result.get_counts()
+            selected_idx = int(max(counts.items(), key=lambda x: x[1])[0].split(' ')[-1], 2)
+            return self.children[min(selected_idx, num_children - 1)]
+        except Exception as e:
+            self.get_logger().warn(f"Quantum selection failed ({e}), falling back to classical method.")
+            return self.classical_best_child(goal_state, heuristic_fn, heuristic_weight)
+
+class QuantumMCTSPlanner:
+    def __init__(self, get_logger_func: Callable, grid_width: int, grid_height: int, obstacles: Set[Tuple[int, int]], heuristic_weight: float, distance_penalty_factor: float):
+        self.get_logger = get_logger_func
+        self.grid_width = grid_width
+        self.grid_height = grid_height
+        self.obstacles = obstacles
+        self.heuristic_weight = heuristic_weight
+        self.distance_penalty_factor = distance_penalty_factor
+        self.max_simulation_steps = 400
+        self.simulation_epsilon = 0.3 # Slightly more exploration
+        self.goal_reward = 1000.0
+        self.step_penalty = -1.0
+        self.collision_penalty = -500.0
+        self.simulation_cache = {}
+
+    def is_valid_state(self, state: Tuple[int, int]) -> bool:
+        x, y = state
+        return (0 <= x < self.grid_width and 0 <= y < self.grid_height and state not in self.obstacles)
+    
+    def heuristic_distance(self, a: Tuple[int, int], b: Tuple[int, int]) -> float:
+        return math.hypot(a[0] - b[0], a[1] - b[1])
+
+    def get_actions(self, state: Tuple[int, int]) -> List[Tuple[int, int]]:
+        x, y = state
+        possible_actions = [(x+1, y), (x-1, y), (x, y+1), (x, y-1), (x+1, y+1), (x+1, y-1), (x-1, y+1), (x-1, y-1)]
+        return [a for a in possible_actions if self.is_valid_state(a)]
+
+    def a_star_search(self, start: Tuple[int, int], goal: Tuple[int, int]) -> List[Tuple[int, int]]:
+        open_set = [(0, start)]
+        came_from = {}
+        g_score = {start: 0}
+        
+        while open_set:
+            _, current = heapq.heappop(open_set)
+            
+            if current == goal:
+                path = []
+                while current in came_from:
+                    path.append(current)
+                    current = came_from[current]
+                path.append(start)
+                return path[::-1]
+
+            for neighbor in self.get_actions(current):
+                tentative_g_score = g_score[current] + self.heuristic_distance(current, neighbor)
+                
+                if tentative_g_score < g_score.get(neighbor, float('inf')):
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g_score
+                    f_score = tentative_g_score + self.heuristic_distance(neighbor, goal)
+                    heapq.heappush(open_set, (f_score, neighbor))
+        
+        return []
+
+    # --- DEFINITIVELY CORRECTED: Simulation is now guided by the A* path correctly ---
+    def simulate(self, start: Tuple[int, int], goal: Tuple[int, int], a_star_guideline: Optional[List[Tuple[int, int]]]) -> float:
+        cache_key = (start, goal)
+        if cache_key in self.simulation_cache: return self.simulation_cache[cache_key]
+        
+        current = start
+        total_reward = 0.0
+        
+        # Determine the local target for the entire simulation
+        local_target = goal
+        if a_star_guideline:
+            # Find the closest point on the guideline to our simulation's start point
+            closest_idx = min(range(len(a_star_guideline)), key=lambda i: self.heuristic_distance(start, a_star_guideline[i]))
+            
+            # Set the target to be a few steps ahead on the guideline path
+            target_idx = min(closest_idx + 5, len(a_star_guideline) - 1)
+            local_target = a_star_guideline[target_idx]
+
+        for _ in range(self.max_simulation_steps):
+            if current == goal:
+                total_reward += self.goal_reward
+                break
+            
+            possible_next = self.get_actions(current)
+            if not possible_next:
+                total_reward += self.collision_penalty
+                break
+            
+            # Epsilon-greedy policy aimed at the consistent local target
+            current = random.choice(possible_next) if random.random() < self.simulation_epsilon else min(possible_next, key=lambda s: self.heuristic_distance(s, local_target))
+            
+            total_reward += self.step_penalty
+            # The main reward gradient still comes from the final goal
+            total_reward -= self.heuristic_distance(current, goal) * self.distance_penalty_factor
+        
+        self.simulation_cache[cache_key] = total_reward
+        return total_reward
+    
+    def search(self, root_state: Tuple[int, int], goal_state: Tuple[int, int], max_iterations: int, max_planning_time: float) -> List[Tuple[int, int]]:
+        
+        # 1. Run A* to get a global guideline path.
+        self.get_logger().info("Running A* to generate a global guideline...")
+        a_star_path = self.a_star_search(root_state, goal_state)
+        
+        if not a_star_path:
+            self.get_logger().warn("A* failed to find a global path. MCTS will run unguided.")
+        else:
+            self.get_logger().info(f"A* found a guideline of {len(a_star_path)} points.")
+
+        # 2. Run MCTS, using the A* path (if it exists) to guide the simulations.
+        self.simulation_cache = {}
+        root_node = QuantumMCTSNode(root_state)
+        root_node.untried_actions = self.get_actions(root_state)
+        root_node.get_logger = self.get_logger
+        start_time = time.time()
+        
+        for i in range(max_iterations):
+            if time.time() - start_time > max_planning_time:
+                self.get_logger().warn(f"MCTS time limit ({max_planning_time}s) reached after {i} iterations.")
+                break
+            
+            node = self.select(root_node, goal_state)
+            if node.state == goal_state:
+                self.backpropagate(node, self.goal_reward)
+                continue
+            
+            child = self.expand(node)
+            if child:
+                # Pass the A* path to the simulation
+                reward = self.simulate(child.state, goal_state, a_star_path)
+                self.backpropagate(child, reward)
+            else:
+                self.backpropagate(node, self.collision_penalty)
+        
+        # 3. Extract the final, high-quality path from the MCTS tree.
+        path, current = [], root_node
+        while current and current.state != goal_state:
+            path.append(current.state)
+            if not current.children: return [] # MCTS failed to connect
+            current = max(current.children, key=lambda c: c.visits)
+        
+        if current and current.state == goal_state:
+            path.append(goal_state)
+            return path
+            
+        return [] # Return empty if no path was found
+
+    def select(self, node: QuantumMCTSNode, goal_state: Tuple[int, int]) -> QuantumMCTSNode:
+        while node.is_fully_expanded() and node.children:
+            node = node.best_child(goal_state, self.heuristic_distance, self.heuristic_weight, use_quantum=(node.visits % 10 == 0))
+        return node
+    
+    def expand(self, node: QuantumMCTSNode) -> Optional[QuantumMCTSNode]:
+        if not node.untried_actions: return None
+        action = node.untried_actions.pop()
+        return node.add_child(action, self.get_actions(action)) if self.is_valid_state(action) else None
+
+    def backpropagate(self, node: QuantumMCTSNode, reward: float):
+        current = node
+        while current:
+            current.visits += 1
+            current.value += reward
+            current = current.parent

@@ -1,0 +1,6 @@
+[console_scripts]
+benchmark_runner = montecarlowwalk.benchmark_runner:main
+grover_benchmark = montecarlowwalk.grover_benchmark:run_grover_benchmark
+mcts_planner_node = montecarlowwalk.mcts_planner_node:main
+quantum_mcts_node = montecarlowwalk.quantum_mcts_node:main
+
